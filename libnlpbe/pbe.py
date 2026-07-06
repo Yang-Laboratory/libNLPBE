@@ -168,7 +168,7 @@ def make_phi_sol(solvent_obj, dm=None, coords=None):
     _intermediates = solvent_obj._intermediates
 
     mol = solvent_obj.mol
-    ngrids = solvent_obj.grids.ngrids
+    tot_ngrids = coords.shape[0]
 
     # Nuclear part
     atom_coords = mol.atom_coords()
@@ -200,10 +200,10 @@ def make_phi_sol(solvent_obj, dm=None, coords=None):
     g = dm_tril.dot(int3c2e)
     cK = scipy.linalg.cho_solve(scipy.linalg.cho_factor(int2c2e), g)
 
-    Vele = numpy.empty(ngrids**3, order='C')
+    Vele = numpy.empty(tot_ngrids, order='C')
     max_memory = solvent_obj.max_memory - lib.current_memory()[0] - Vele.nbytes*1e-6
     blksize = int(max(max_memory*.9e6/8/naux, 400))
-    for p0, p1 in lib.prange(0, ngrids**3, blksize):
+    for p0, p1 in lib.prange(0, tot_ngrids, blksize):
         fakemol = gto.fakemol_for_charges(coords[p0:p1])
         ints = gto.intor_cross('int2c2e', fakemol, auxmol)
         Vele[p0:p1] = ints.dot(cK)
@@ -404,25 +404,25 @@ def make_precond(solvent_obj, drho_ions_scr=None):
     c_ncycle = ctypes.c_int(1)
     c_pre_cycles = ctypes.c_int(1)
 
-    hirarchy = libamgcl.amg_create(c_tot_ngrids, c_indptr, c_indices, c_data,
+    hierarchy = libamgcl.amg_create(c_tot_ngrids, c_indptr, c_indices, c_data,
                                    c_max_levels, c_coarse_enough, c_relax,
                                    c_npre, c_npost, c_ncycle, c_pre_cycles)
-    solvent_obj.hirarchy = hirarchy
+    solvent_obj.hierarchy = hierarchy
 
     def vcycle(r, out):
         c_r = r.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
         c_out = out.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
-        libamgcl.amg_vcycle(ctypes.c_void_p(hirarchy), c_r, c_out, c_tot_ngrids)
+        libamgcl.amg_vcycle(ctypes.c_void_p(hierarchy), c_r, c_out, c_tot_ngrids)
         return out
 
     return vcycle
 
 def _release_caches(solvent_obj):
     """Release memory after make_phi"""
-    if getattr(solvent_obj, 'hirarchy', None) is not None:
-        hirarchy = solvent_obj.hirarchy
-        libamgcl.amg_destroy(ctypes.c_void_p(hirarchy))
-    solvent_obj.hirarchy = None
+    if getattr(solvent_obj, 'hierarchy', None) is not None:
+        hierarchy = solvent_obj.hierarchy
+        libamgcl.amg_destroy(ctypes.c_void_p(hierarchy))
+    solvent_obj.hierarchy = None
     # gc.collect()
 
 def make_phi(solvent_obj, phi_sol=None, rho_sol=None):
@@ -533,7 +533,7 @@ def make_phi(solvent_obj, phi_sol=None, rho_sol=None):
             res_try, rho_ions_try = residual(phi_tot + damping * v, res_old)
             if res_try is None:
                 logger.info(solvent_obj, 'Skipping PBE due to infinite ion charge density.')
-                return None, None, None
+                return None, None
             fnorm_try = numpy.linalg.norm(res_try)
 
         phi_tot = phi_tot + damping * v
@@ -568,7 +568,7 @@ class NLPBE(ddcosmo.DDCOSMO):
         self.phi_tot = None
         self.rho_ions = None
 
-        self.hirarchy = None
+        self.hierarchy = None
         self.operator = None
         self.precond = None
         self.kappa = None
@@ -755,7 +755,7 @@ class Grids(cubegen.Cube):
         self._intermediates = None
 
         _release_caches(self)
-        self.hirarchy = None
+        self.hierarchy = None
         self.operator = None
         self.precond = None
         return self
