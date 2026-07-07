@@ -7,6 +7,7 @@ import h5py
 import libnlpbe
 
 from pyscf import df
+from pyscf import gto
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf.solvent import ddcosmo
