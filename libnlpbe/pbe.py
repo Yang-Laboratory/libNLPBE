@@ -455,7 +455,7 @@ def make_phi(solvent_obj, phi_sol=None, rho_sol=None):
     A = solvent_obj.make_operator(grad_lneps)
 
     if cb == 0.0:
-        drho_ions_scr = None
+        drho_ions_scr = numpy.zeros(tot_ngrids)
     else:
         drho_ions_scr = -inv_eps * get_drho_ions(solvent_obj, numpy.zeros(tot_ngrids), cb, lambda_r, T)
 
