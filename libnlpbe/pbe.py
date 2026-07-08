@@ -638,11 +638,12 @@ class NLPBE(ddcosmo.DDCOSMO):
 
         vmat = numpy.zeros([nao, nao], order='C')
         max_memory = self.max_memory - lib.current_memory()[0]
-        blksize = int(max(max_memory*.9e6/8/nao, 400))
+        blksize = int(min(max(max_memory*.9e6/8/nao/2, 400), tot_ngrids))
+        buf = numpy.empty((blksize, nao), order='C')
         for p0, p1 in lib.prange(0, tot_ngrids, blksize):
             ao = mol.eval_gto('GTOval', coords[p0:p1])
-            buf = ao * phi_pol[p0:p1, None]
-            vmat -= numpy.dot(buf.T, ao)
+            buf[:p1-p0] = ao * phi_pol[p0:p1, None]
+            vmat -= numpy.dot(buf[:p1-p0].T, ao)
         vmat *= spacing**3
         t0 = logger.timer(self, 'v_diel', *t0)
         return vmat
