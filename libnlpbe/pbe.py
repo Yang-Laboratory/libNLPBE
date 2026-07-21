@@ -86,6 +86,23 @@ def make_gradient_matrix(ngrids):
 
     return scipy.sparse.csr_matrix((vals, (rows, cols)), shape=(ngrids, ngrids))
 
+def gradient(solvent_obj, phi, ngrids, spacing):
+    """8th-order finite-difference gradient of a scalar field on the cubic grid.
+
+    Returns an ``(n_grid, 3)`` array. Used at convergence to build the
+    polarization charge density ``rho_pol``. Matches the stencil used to
+    assemble the linear operator in :func:`make_operator`.
+    """
+    grad = make_gradient_matrix(ngrids)
+    I = scipy.sparse.identity(ngrids, format='csr')
+    G = (scipy.sparse.kron(grad, scipy.sparse.kron(I, I)),
+         scipy.sparse.kron(I, scipy.sparse.kron(grad, I)),
+         scipy.sparse.kron(I, scipy.sparse.kron(I, grad)))
+    dphi = numpy.empty((phi.size, 3), dtype=numpy.float64)
+    for xi in range(3):
+        dphi[:, xi] = G[xi].dot(phi) / spacing
+    return dphi
+
 def make_lambda(solvent_obj, mol, probe, stern_mol, coords, delta, atomic_radii):
 
     atom_coords = mol.atom_coords()
@@ -424,7 +441,6 @@ def _release_caches(solvent_obj):
         hierarchy = solvent_obj.hierarchy
         libamgcl.amg_destroy(ctypes.c_void_p(hierarchy))
     solvent_obj.hierarchy = None
-    # gc.collect()
 
 def make_phi(solvent_obj, phi_sol=None, rho_sol=None):
     if solvent_obj._intermediates is None: solvent_obj.build()
@@ -441,7 +457,7 @@ def make_phi(solvent_obj, phi_sol=None, rho_sol=None):
     grad_eps = _intermediates['grad_eps']
 
     max_cycle = solvent_obj.max_cycle # Newton cycle
-    inner_max_cycle = 100 # Inner cycle
+    inner_max_cycle = solvent_obj.inner_max_cycle
 
     C_TST = 0.01
     p_TST = 1.0
@@ -449,6 +465,8 @@ def make_phi(solvent_obj, phi_sol=None, rho_sol=None):
     grad_lneps = grad_eps / eps[:, None]
     get_rho_ions = solvent_obj._gen_get_rho_ions()
     get_drho_ions = solvent_obj._gen_drho_ions()
+
+    bc, const_src = solvent_obj._boundary_conditions(ngrids, spacing)
 
     inv_eps = 4.0 * PI / eps
 
@@ -461,28 +479,37 @@ def make_phi(solvent_obj, phi_sol=None, rho_sol=None):
 
     precond = solvent_obj.make_precond(drho_ions_scr)
 
-    def residual(phi_tot, out):
+    def residual(phi_opt, out):
+        phi_tot = phi_opt + bc
         rho_ions = get_rho_ions(solvent_obj, phi_tot, cb, lambda_r, T)
         if numpy.isnan(rho_ions).any():
             return None, rho_ions
         rho_tot = rho_sol + rho_ions
-        A(phi_tot, out)
-        out += inv_eps * rho_tot
+        A(phi_opt, out)
+        out += inv_eps * rho_tot + const_src
         return out, rho_ions
+
+    def finalize(phi_opt, rho_ions):
+        rho_tot = rho_sol + rho_ions
+        dphi = solvent_obj.gradient(phi_opt, ngrids, spacing)
+        rho_iter = 0.25 / PI * (grad_lneps * dphi).sum(axis=1)
+        rho_pol = (1.0 - eps) / eps * rho_tot + rho_iter
+        phi_tot = phi_opt + bc
+        return phi_tot, rho_ions, rho_pol
 
     logger.info(solvent_obj, ' -*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*')
     logger.info(solvent_obj, ' |  Poisson-Boltzmann Solver with the Multigrid Scheme  |')
     logger.info(solvent_obj, ' -*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*')
 
-    phi_tot = numpy.zeros(tot_ngrids, dtype=numpy.float64)
+    phi_opt = numpy.zeros(tot_ngrids, dtype=numpy.float64)
     res_old = numpy.empty(tot_ngrids, dtype=numpy.float64)
     res_new = numpy.empty(tot_ngrids, dtype=numpy.float64)
-    res_outer, rho_ions = residual(phi_tot, res_new)
+    res_outer, rho_ions = residual(phi_opt, res_new)
 
     if res_outer is None:
         logger.info(solvent_obj, 'Skipping PBE due to infinite ion charge density.')
-        return None, None
-    
+        return None, None, None
+
     fnorm = numpy.linalg.norm(res_outer)
 
     res_inner = numpy.empty(tot_ngrids, dtype=numpy.float64)
@@ -494,6 +521,7 @@ def make_phi(solvent_obj, phi_sol=None, rho_sol=None):
 
     cycle = 0
     while cycle < max_cycle:
+        phi_tot = phi_opt + bc
         drho_ions = get_drho_ions(solvent_obj, phi_tot, cb, lambda_r, T)
         jac_diag = inv_eps * drho_ions
 
@@ -520,7 +548,7 @@ def make_phi(solvent_obj, phi_sol=None, rho_sol=None):
         damping = 1.0
         accepted = False
         while damping > 1.0e-5:
-            res_try, rho_ions_try = residual(phi_tot + damping * v, res_old)
+            res_try, rho_ions_try = residual(phi_opt + damping * v, res_old)
             if res_try is not None:
                 fnorm_try = numpy.linalg.norm(res_try)
                 if fnorm_try < (1.0 - damping / 10**4) * fnorm:
@@ -531,13 +559,13 @@ def make_phi(solvent_obj, phi_sol=None, rho_sol=None):
         if not accepted:
             logger.warn(solvent_obj, 'Newton line search failed at cycle %d '
                         '(||F|| = %4.3e, inner = %d).', cycle + 1, fnorm, inner)
-            res_try, rho_ions_try = residual(phi_tot + damping * v, res_old)
+            res_try, rho_ions_try = residual(phi_opt + damping * v, res_old)
             if res_try is None:
                 logger.info(solvent_obj, 'Skipping PBE due to infinite ion charge density.')
-                return None, None
+                return None, None, None
             fnorm_try = numpy.linalg.norm(res_try)
 
-        phi_tot = phi_tot + damping * v
+        phi_opt = phi_opt + damping * v
         res_outer, rho_ions = res_try, rho_ions_try
         fnorm = fnorm_try
         res_new, res_old = res_old, res_new   # accepted trial becomes current
@@ -547,7 +575,7 @@ def make_phi(solvent_obj, phi_sol=None, rho_sol=None):
 
         if fnorm < 1.0e-9:
             t0 = logger.timer(solvent_obj, 'phi_tot', *t0)
-            return phi_tot, rho_ions
+            return finalize(phi_opt, rho_ions)
 
     raise RuntimeError('PBE solver failed to converge.')
 
@@ -569,6 +597,7 @@ class NLPBE(ddcosmo.DDCOSMO):
         self.phi_tot = None
         self.rho_ions = None
 
+        self.inner_max_cycle = 200
         self.hierarchy = None
         self.operator = None
         self.precond = None
@@ -599,16 +628,15 @@ class NLPBE(ddcosmo.DDCOSMO):
         self.phi_sol = phi_sol
         rho_sol = self.make_rho_sol(phi_sol, ngrids, spacing)
         self.rho_sol = rho_sol
-        phi_tot, rho_ions = self.make_phi(phi_sol, rho_sol)
+        phi_tot, rho_ions, rho_pol = self.make_phi(phi_sol, rho_sol)
 
         if phi_tot is None:
             return 0.0, numpy.zeros(dm.shape)
-        
+
         self.phi_tot = phi_tot
         self.rho_ions = rho_ions
 
         phi_pol = phi_tot - phi_sol
-        self.phi_pol = phi_pol
 
         epbe = numpy.dot(rho_sol, phi_pol) * spacing**3
 
@@ -656,7 +684,7 @@ class NLPBE(ddcosmo.DDCOSMO):
         if spacing is None: spacing = self.grids.spacing
         return energy_osm_one_to_one(self, phi_tot, cb, lambda_r, T, spacing)
 
-    def build(self):
+    def build(self, auxbasis=None):
         if self.grids.coords is None:
             self.grids.build()
 
@@ -681,8 +709,8 @@ class NLPBE(ddcosmo.DDCOSMO):
             self.L = ch.poisson((ngrids,)*3, format='csr')
 
         self.kappa = numpy.sqrt(8.0e0 * PI * cb / self.eps / KB2HARTREE / self.T)
-
-        auxmol = df.addons.make_auxmol(mol)
+        if auxbasis is None: auxbasis = 'def2-universal-jkfit'
+        auxmol = df.addons.make_auxmol(mol, auxbasis)
         erifile = tempfile.NamedTemporaryFile(dir=lib.param.TMPDIR)
         int2c2e = auxmol.intor('int2c2e')
         int3c2e = df.incore.aux_e2(mol, auxmol, intor='int3c2e', aosym='s2kl')
@@ -702,12 +730,28 @@ class NLPBE(ddcosmo.DDCOSMO):
             'erifile': erifile,
         }
 
+    def _boundary_conditions(self, ngrids, spacing):
+        "A hooker for boundary conditions"
+        return 0.0, 0.0
+
     def _gen_get_rho_ions(self):
         return rho_ions_one_to_one
 
     def _gen_drho_ions(self):
         return drho_ions_one_to_one
 
+    def reset(self, mol=None):
+        if mol is not None:
+            self.mol = mol
+        self._intermediates = None
+
+        _release_caches(self)
+        self.hierarchy = None
+        self.operator = None
+        self.precond = None
+        return self
+
+    gradient = gradient
     make_lambda = make_lambda
     make_sas = make_sas
     make_grad_sas = make_grad_sas
@@ -749,17 +793,6 @@ class Grids(cubegen.Cube):
         self.coords = self.get_coords()
         self.boxorig = self.coords[0]
         self.spacing = self.length / (self.nx - 1)
-        return self
-
-    def reset(self, mol=None):
-        if mol is not None:
-            self.mol = mol
-        self._intermediates = None
-
-        _release_caches(self)
-        self.hierarchy = None
-        self.operator = None
-        self.precond = None
         return self
 
 if __name__=='__main__':
