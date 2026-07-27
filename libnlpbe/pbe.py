@@ -263,6 +263,16 @@ def make_rho_sol(solvent_obj, phi_sol=None, ngrids=None, spacing=None):
     L = solvent_obj.L
     rho_sol = L.dot(phi_sol) / 4.0 / PI / spacing**2
 
+    # Zero-out boundary values
+    rho_sol = rho_sol.reshape((ngrids,)*3)
+    idx = numpy.arange(ngrids)
+    idx = (idx < 4) | (idx >= ngrids-4)
+    rho_sol[idx,:,:] = 0.0
+    rho_sol[:,idx,:] = 0.0
+    rho_sol[:,:,idx] = 0.0
+    rho_sol = rho_sol.reshape(ngrids**3)
+    logger.info(solvent_obj, 'charge by poisson equation = %s', rho_sol.sum() * spacing**3)
+
     return rho_sol
 
 def rho_ions_one_to_one(solvent_obj, phi_tot=None, cb=None, lambda_r=None, T=None):
